@@ -12,7 +12,17 @@ from jsonschema import ValidationError, validate
 
 from airbyte_cdk.models import SyncMode
 from airbyte_cdk.test.state_builder import StateBuilder
-from unit_tests.conftest import get_analytics_columns, get_source, read_from_stream
+from unit_tests.conftest import (
+    NON_BREAKDOWN_REPORT_STREAMS,
+    TARGETING_GRAIN_COLUMNS,
+    get_analytics_columns,
+    get_product_item_base_columns,
+    get_report_columns,
+    get_source,
+    get_stream_by_name,
+    get_targeting_base_columns,
+    read_from_stream,
+)
 
 
 os.environ["REQUEST_CACHE_PATH"] = "/tmp"
@@ -592,3 +602,156 @@ def test_custom_report_status_filters_allow_more_than_six_values(test_config, fi
     validate(valid_statuses, status_schema)
     with pytest.raises(ValidationError):
         validate(invalid_statuses, status_schema)
+
+
+# --- Breakdown-grain columns (https://github.com/airbytehq/airbyte/issues/87050) -------------------
+#
+# A report requested at a breakdown level must also request the column that identifies that
+# breakdown. Without it one campaign-day comes back as several records that differ only in their
+# metrics, the grain is lost, and the rows look like duplicates.
+
+BREAKDOWN_REPORT_STREAMS = [
+    "product_group_report",
+    "product_item_report",
+    "campaign_targeting_report",
+    "advertiser_targeting_report",
+    "ad_group_targeting_report",
+    "pin_promotion_targeting_report",
+    "product_group_targeting_report",
+    "keyword_report",
+]
+
+ALL_GRAIN_COLUMNS = TARGETING_GRAIN_COLUMNS + ["PRODUCT_GROUP_ID", "PRODUCT_ITEM_ID", "KEYWORD_ID"]
+
+
+def _read_report_and_capture_body(requests_mock, test_config, stream_name):
+    """Run one incremental read of a report stream and return its report-creation request body."""
+    report_download_url = "https://download.report"
+    report_request_url = "https://api.pinterest.com/v5/ad_accounts/123/reports"
+    captured = []
+
+    def capture_body(request):
+        raw = request.body.decode() if isinstance(request.body, (bytes, bytearray)) else request.body
+        captured.append(json.loads(raw))
+        return True
+
+    requests_mock.get("https://api.pinterest.com/v5/ad_accounts", json={"items": [{"id": 123}]})
+    requests_mock.post(
+        report_request_url,
+        json={"report_status": "IN_PROGRESS", "token": "token", "message": ""},
+        additional_matcher=capture_body,
+    )
+    requests_mock.get(report_request_url, json={"report_status": "FINISHED", "url": report_download_url})
+    requests_mock.get(report_download_url, json={"metric": 1})
+
+    state = StateBuilder().with_stream_state(stream_name, {"DATE": "2022-11-15"}).build()
+    list(read_from_stream(test_config, stream_name, SyncMode.incremental, state=state).records)
+
+    assert captured, f"no report creation request was captured for {stream_name}"
+    return captured[-1]
+
+
+@freeze_time("2022-11-16 12:03:11+00:00")
+@pytest.mark.parametrize("stream_name", NON_BREAKDOWN_REPORT_STREAMS, ids=lambda s: s)
+def test_non_breakdown_report_requests_are_unchanged(requests_mock, test_config, stream_name):
+    """Regression guard: streams without a breakdown grain must keep requesting exactly the
+    `basic_async_retriever` column set. This passes before and after the #87050 fix."""
+    body = _read_report_and_capture_body(requests_mock, test_config, stream_name)
+
+    assert body["columns"] == get_analytics_columns().split(",")
+    assert not set(body["columns"]) & set(ALL_GRAIN_COLUMNS)
+
+
+@freeze_time("2022-11-16 12:03:11+00:00")
+@pytest.mark.parametrize("stream_name", BREAKDOWN_REPORT_STREAMS, ids=lambda s: s)
+def test_breakdown_report_requests_are_strict_superset_of_previous_columns(requests_mock, test_config, stream_name):
+    """Every breakdown stream keeps its previous columns and gains only its own grain identifier."""
+    body = _read_report_and_capture_body(requests_mock, test_config, stream_name)
+    expected = get_report_columns(stream_name)
+
+    assert body["columns"] == expected
+    previous = {
+        "product_group_report": get_analytics_columns().split(","),
+        "product_item_report": get_product_item_base_columns(),
+    }.get(stream_name, get_targeting_base_columns())
+    added = [column for column in expected if column not in previous]
+
+    assert added, f"{stream_name} gained no columns"
+    assert set(previous).issubset(set(expected)), f"{stream_name} dropped columns it used to request"
+
+
+@freeze_time("2022-11-16 12:03:11+00:00")
+def test_product_group_report_requests_product_group_id(requests_mock, test_config):
+    body = _read_report_and_capture_body(requests_mock, test_config, "product_group_report")
+
+    assert body["columns"] == get_analytics_columns().split(",") + ["PRODUCT_GROUP_ID"]
+    assert body["level"] == "PRODUCT_GROUP"
+
+
+@freeze_time("2022-11-16 12:03:11+00:00")
+def test_product_item_report_requests_product_item_id(requests_mock, test_config):
+    body = _read_report_and_capture_body(requests_mock, test_config, "product_item_report")
+
+    assert body["columns"] == get_product_item_base_columns() + ["PRODUCT_ITEM_ID"]
+    assert body["level"] == "PRODUCT_ITEM"
+    # Pinterest rejects ad / pin-promotion columns at the PRODUCT_ITEM level.
+    assert "AD_ID" not in body["columns"]
+    assert "PIN_PROMOTION_ID" not in body["columns"]
+
+
+@freeze_time("2022-11-16 12:03:11+00:00")
+@pytest.mark.parametrize(
+    "stream_name,level",
+    [
+        pytest.param("campaign_targeting_report", "CAMPAIGN_TARGETING", id="campaign_targeting_report"),
+        pytest.param("advertiser_targeting_report", "ADVERTISER_TARGETING", id="advertiser_targeting_report"),
+        pytest.param("ad_group_targeting_report", "AD_GROUP_TARGETING", id="ad_group_targeting_report"),
+        pytest.param("pin_promotion_targeting_report", "PIN_PROMOTION_TARGETING", id="pin_promotion_targeting_report"),
+    ],
+)
+def test_targeting_reports_request_targeting_columns(requests_mock, test_config, stream_name, level):
+    body = _read_report_and_capture_body(requests_mock, test_config, stream_name)
+
+    assert body["columns"] == get_targeting_base_columns() + TARGETING_GRAIN_COLUMNS
+    assert body["level"] == level
+    for column in TARGETING_GRAIN_COLUMNS:
+        assert column in body["columns"]
+
+
+@freeze_time("2022-11-16 12:03:11+00:00")
+def test_product_group_targeting_report_requests_grain_columns(requests_mock, test_config):
+    body = _read_report_and_capture_body(requests_mock, test_config, "product_group_targeting_report")
+
+    assert body["columns"] == get_targeting_base_columns() + TARGETING_GRAIN_COLUMNS + ["PRODUCT_GROUP_ID"]
+    assert body["level"] == "PRODUCT_GROUP_TARGETING"
+
+
+@freeze_time("2022-11-16 12:03:11+00:00")
+def test_keyword_report_requests_keyword_id(requests_mock, test_config):
+    body = _read_report_and_capture_body(requests_mock, test_config, "keyword_report")
+
+    assert body["columns"] == get_targeting_base_columns() + ["KEYWORD_ID"]
+    assert body["level"] == "KEYWORD"
+    # KEYWORD is not a targeting breakdown: it must not inherit the TARGETING_* columns.
+    for column in TARGETING_GRAIN_COLUMNS:
+        assert column not in body["columns"]
+
+
+def test_reports_schema_declares_breakdown_columns(test_config):
+    """The discovered catalog must type the new grain columns so downstream consumers can rely on them."""
+    schema = get_stream_by_name("campaign_analytics_report", test_config).get_json_schema()
+    properties = schema["properties"]
+
+    for column in ALL_GRAIN_COLUMNS:
+        assert column in properties, f"{column} missing from reports_schema"
+        assert properties[column]["type"] == ["null", "string"], column
+
+
+def test_custom_report_spec_allows_breakdown_columns(test_config):
+    """Custom reports could not request the grain columns at all; the spec enum must accept them."""
+    columns_items_schema = (
+        get_source(test_config).spec(None).connectionSpecification["properties"]["custom_reports"]["items"]["properties"]["columns"]["items"]
+    )
+
+    for column in ALL_GRAIN_COLUMNS:
+        validate(column, columns_items_schema)

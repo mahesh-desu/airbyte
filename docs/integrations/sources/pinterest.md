@@ -185,7 +185,12 @@ properties:
    AD_GROUP, etc. The default level is ADVERTISER.
 3. **Granularity**: Determines the data granularity, such as TOTAL, DAY, HOUR, etc. The default is
    TOTAL, where metrics are aggregated over the specified date range.
-4. **Columns**: Identifies the data columns to be included in the report.
+4. **Columns**: Identifies the data columns to be included in the report. Reports requested at a
+   breakdown level (ADVERTISER_TARGETING, CAMPAIGN_TARGETING, AD_GROUP_TARGETING,
+   PIN_PROMOTION_TARGETING, PRODUCT_GROUP_TARGETING, PRODUCT_GROUP, PRODUCT_ITEM or KEYWORD) should
+   also select the matching grain column (`TARGETING_TYPE`, `TARGETING_VALUE`, `TARGETING_VALUE_NAME`,
+   `PRODUCT_GROUP_ID`, `PRODUCT_ITEM_ID` or `KEYWORD_ID`), otherwise the rows cannot be attributed to
+   a targeting value, product or keyword.
 5. **Click Window Days (Optional)**: The number of days used for conversion attribution from a pin
    click action. This applies to Pinterest Tag conversion metrics. Valid values are 0, 1, 7, 14,
    30, and 60. Defaults to 30 days if not specified. Set to 0 to disable click attribution.
@@ -256,6 +261,7 @@ If you use Airbyte Cloud and your organization restricts access to specific IPs,
 
 | Version     | Date       | Pull Request                                             | Subject                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 |:------------|:-----------|:---------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 2.4.0 | 2026-10-04 | [00000](https://github.com/airbytehq/airbyte/pull/00000) | Request the breakdown grain columns in report streams: `TARGETING_TYPE`, `TARGETING_VALUE` and `TARGETING_VALUE_NAME` on the targeting reports, `PRODUCT_GROUP_ID` on the product group reports, `PRODUCT_ITEM_ID` on the product item report, and `KEYWORD_ID` on the keyword report. Also make these columns available to custom reports. |
 | 2.3.4 | 2026-09-29 | [87273](https://github.com/airbytehq/airbyte/pull/87273) | Update dependencies |
 | 2.3.3 | 2026-09-22 | [86737](https://github.com/airbytehq/airbyte/pull/86737) | Update dependencies |
 | 2.3.2 | 2026-09-15 | [86186](https://github.com/airbytehq/airbyte/pull/86186) | Update dependencies |

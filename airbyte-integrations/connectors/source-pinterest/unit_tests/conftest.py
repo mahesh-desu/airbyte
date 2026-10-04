@@ -258,3 +258,73 @@ def get_analytics_columns() -> str:
         "WEB_SESSIONS_2",  #
     ]
     return ",".join(analytics_columns)
+
+
+# --- Breakdown-grain columns (https://github.com/airbytehq/airbyte/issues/87050) -------------------
+#
+# A report requested at a breakdown level (targeting / product group / product item / keyword) must
+# also request the column that identifies that breakdown, otherwise one campaign-day comes back as
+# several records that differ only in their metrics and the grain is lost.
+#
+# Each report level only accepts certain columns, so the additions below are per-stream and never
+# blanket-applied to a shared list.
+
+TARGETING_GRAIN_COLUMNS = ["TARGETING_TYPE", "TARGETING_VALUE", "TARGETING_VALUE_NAME"]
+
+# `analytics_tagreting_report_base_stream` in manifest.yaml drops these two impression metrics
+# relative to the `basic_async_retriever` column set returned by `get_analytics_columns()`.
+_TARGETING_BASE_EXCLUDED = ("TOTAL_IMPRESSION_FREQUENCY", "TOTAL_IMPRESSION_USER")
+
+# `product_item_report_stream` in manifest.yaml drops ad / pin-promotion columns, matching Pinterest's
+# "Pin promotion and ad related columns are not supported for the Product Item level reports".
+_PRODUCT_ITEM_BASE_EXCLUDED = ("AD_ID", "PIN_PROMOTION_ID")
+
+# Streams that must not change as part of #87050. Their request body is asserted byte-for-byte so a
+# regression to a non-breakdown report fails loudly.
+NON_BREAKDOWN_REPORT_STREAMS = [
+    "advertiser_report",
+    "ad_group_report",
+    "campaign_analytics_report",
+    "pin_promotion_report",
+]
+
+
+def get_targeting_base_columns() -> list:
+    return [column for column in get_analytics_columns().split(",") if column not in _TARGETING_BASE_EXCLUDED]
+
+
+def get_product_item_base_columns() -> list:
+    return [column for column in get_analytics_columns().split(",") if column not in _PRODUCT_ITEM_BASE_EXCLUDED]
+
+
+def get_report_columns(stream_name: str) -> list:
+    """Expected `columns` in the async report request body for a report stream.
+
+    Encodes the per-level contract from #87050. New grain columns are appended at the end of each
+    list; the manifest mirrors this ordering so request bodies stay comparable.
+    """
+    base = get_analytics_columns().split(",")
+    targeting_base = get_targeting_base_columns()
+    product_item_base = get_product_item_base_columns()
+
+    per_stream = {
+        # Non-breakdown levels: unchanged (the `basic_async_retriever` column set).
+        "advertiser_report": base,
+        "ad_group_report": base,
+        "campaign_analytics_report": base,
+        "pin_promotion_report": base,
+        # Breakdown levels: exactly the missing grain identifier is requested.
+        "product_group_report": base + ["PRODUCT_GROUP_ID"],
+        "product_item_report": product_item_base + ["PRODUCT_ITEM_ID"],
+        "campaign_targeting_report": targeting_base + TARGETING_GRAIN_COLUMNS,
+        "advertiser_targeting_report": targeting_base + TARGETING_GRAIN_COLUMNS,
+        "ad_group_targeting_report": targeting_base + TARGETING_GRAIN_COLUMNS,
+        "pin_promotion_targeting_report": targeting_base + TARGETING_GRAIN_COLUMNS,
+        "product_group_targeting_report": targeting_base + TARGETING_GRAIN_COLUMNS + ["PRODUCT_GROUP_ID"],
+        # keyword_report is served by the targeting base stream but is not itself a targeting
+        # breakdown, so it must NOT pick up the TARGETING_* columns.
+        "keyword_report": targeting_base + ["KEYWORD_ID"],
+    }
+    if stream_name not in per_stream:
+        raise ValueError(f"Unknown report stream: {stream_name!r}")
+    return per_stream[stream_name]
